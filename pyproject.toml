@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sccody"
+version = "0.1.0"
+description = "A reusable single-cell population transport pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["anndata>=0.10", "numpy>=1.24", "pandas>=2", "scipy>=1.10", "torch>=2.1", "geomloss>=0.2.6", "pyyaml>=6"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+sccody = "sccody.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

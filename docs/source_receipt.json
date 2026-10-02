@@ -1,0 +1,35 @@
+{
+  "source_repository": "scCodyFlow",
+  "source_revision": "ecd5abe0dfd461190ba96b39d159c886ef7950ed",
+  "source_has_working_tree_changes": true,
+  "sources": [
+    {
+      "source": "src/model/vae.py",
+      "sha256": "46c4739cd4776fdc2d257b6dbbe613ef930fd3e49848e6d73003163566b411ee"
+    },
+    {
+      "source": "src/model/net.py",
+      "sha256": "28e38a54fb254fd266b75e1ba98d1122659a44d3bfe0e42664deb8d9da9cf311"
+    },
+    {
+      "source": "src/model/flowmap.py",
+      "sha256": "10448346a62e4e194174d5be3f3dbbce42ce0303eb2e6f56c7d50cace7891c63"
+    },
+    {
+      "source": "docs/results_final_provenance/REPORT.md",
+      "sha256": "0c6f943a6071ace51276922db01439e1b6d91dbd2056900032415e671b549f66"
+    }
+  ],
+  "extracted_classes": [
+    "CellTypeConditionedFlowMap",
+    "CellTypeEmbedding",
+    "DriftHead",
+    "FlowMapTimeEmbed",
+    "GMVAE",
+    "GMVAE_NB",
+    "TimeEncoding",
+    "VAE",
+    "VAE_NB"
+  ],
+  "created": "2026-10-02"
+}

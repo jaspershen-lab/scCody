@@ -1,0 +1,26 @@
+{
+  "date": "2026-10-02",
+  "suite": {
+    "passed": 14,
+    "failed": 0,
+    "test_modules": 3,
+    "synthetic_panels": 2
+  },
+  "runtime": {
+    "torch": "2.9.0",
+    "anndata": "0.12.1",
+    "numpy": "2.2.6",
+    "pandas": "2.2.3",
+    "geomloss": "0.2.6"
+  },
+  "device": "cpu",
+  "cuda_available": false,
+  "installed_cli_outside_repo": "passed",
+  "installed_cli_demo": "passed",
+  "demo_selection": {
+    "criterion": "validation_gene_ot",
+    "epoch": 2,
+    "validation_score": 161.26876831054688,
+    "test_samples_used": false
+  }
+}
