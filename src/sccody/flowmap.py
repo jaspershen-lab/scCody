@@ -1,7 +1,56 @@
-"""Shared-trunk population transport with cell-type heads."""
+from __future__ import annotations
+
 import math
 import torch
-from torch import nn
+import torch.nn as nn
+
+from .gmvae import ACT_FUNC_MAP
+
+
+class FlowMapTimeEmbed(nn.Module):
+    """FlowMap MLP X(s, t, z) = z + (t - s) * phi(s, t, z)."""
+
+    def __init__(self, latent_dim: int, hidden_sizes=None, act_name: str = "relu"):
+        super().__init__()
+        self.latent_dim = latent_dim
+        hidden_sizes = [256, 256] if hidden_sizes is None else list(hidden_sizes)
+        act = ACT_FUNC_MAP.get(act_name, nn.GELU())
+
+        layers: list[nn.Module] = []
+        last_dim = latent_dim + 2
+        for hidden_dim in hidden_sizes:
+            layers.append(nn.Linear(last_dim, hidden_dim))
+            layers.append(act)
+            last_dim = hidden_dim
+        layers.append(nn.Linear(last_dim, latent_dim))
+        self.phi_net = nn.Sequential(*layers)
+        nn.init.zeros_(self.phi_net[-1].weight)
+        nn.init.zeros_(self.phi_net[-1].bias)
+
+    def _prepare_time_pair(self, s, t, batch_size: int, device, dtype):
+        if not torch.is_tensor(s):
+            s = torch.tensor(s, device=device, dtype=dtype)
+        if not torch.is_tensor(t):
+            t = torch.tensor(t, device=device, dtype=dtype)
+        if s.ndim == 0:
+            s = s.expand(batch_size)
+        if t.ndim == 0:
+            t = t.expand(batch_size)
+        return (
+            s.to(device=device, dtype=dtype).view(batch_size, 1),
+            t.to(device=device, dtype=dtype).view(batch_size, 1),
+        )
+
+    def calc_phi(self, s, t, z):
+        batch_size, _latent_dim = z.shape
+        s_bt, t_bt = self._prepare_time_pair(s, t, batch_size, z.device, z.dtype)
+        return self.phi_net(torch.cat([z, s_bt, t_bt], dim=1))
+
+    def forward(self, s, t, z):
+        batch_size, _latent_dim = z.shape
+        s_bt, t_bt = self._prepare_time_pair(s, t, batch_size, z.device, z.dtype)
+        return z + (t_bt - s_bt) * self.calc_phi(s_bt.squeeze(-1), t_bt.squeeze(-1), z)
+
 
 class CellTypeEmbedding(nn.Module):
 
@@ -43,7 +92,7 @@ class TimeEncoding(nn.Module):
 class CellTypeConditionedFlowMap(nn.Module):
     """Identity-preserving transport with a shared trunk and per-cell-type heads."""
 
-    def __init__(self, base_flow_map, n_cell_types, latent_dim, ct_embed_dim=32, drift_hidden_dim=128, mode='shared_plus_heads'):
+    def __init__(self, base_flow_map, n_cell_types, latent_dim, ct_embed_dim=32, drift_hidden_dim=128):
         super().__init__()
         self.latent_dim = latent_dim
         self.n_cell_types = n_cell_types
@@ -52,14 +101,8 @@ class CellTypeConditionedFlowMap(nn.Module):
         self.time_enc = TimeEncoding(32)
         self.base_flow_map = base_flow_map
         self.input_adapter = nn.Linear(latent_dim + ct_embed_dim, latent_dim)
-        self.mode = mode
-        if mode in {'shared_plus_heads', 'global_plus_ct_residual'}:
-            drift_input_dim = latent_dim + 32
-            self.drift_heads = nn.ModuleList([DriftHead(drift_input_dim, latent_dim, drift_hidden_dim) for _ in range(n_cell_types)])
-        elif mode == 'concat_embed':
-            pass
-        else:
-            raise ValueError(f'Unknown mode: {mode}')
+        drift_input_dim = latent_dim + 32
+        self.drift_heads = nn.ModuleList([DriftHead(drift_input_dim, latent_dim, drift_hidden_dim) for _ in range(n_cell_types)])
 
     def _time_delta(self, s, t, batch_size: int, device, dtype):
         if not torch.is_tensor(s):
@@ -91,14 +134,9 @@ class CellTypeConditionedFlowMap(nn.Module):
         ct = cell_type_idx
         if ct is None:
             return self.base_flow_map.calc_phi(s, t, z)
-        if self.mode == 'global_plus_ct_residual':
-            shared_velocity = self.base_flow_map.calc_phi(s, t, z)
-        else:
-            ct_emb = self.ct_embedding(ct)
-            z_adapted = self.input_adapter(torch.cat([z, ct_emb], dim=-1))
-            shared_velocity = self.base_flow_map.calc_phi(s, t, z_adapted)
-        if self.mode not in {'shared_plus_heads', 'global_plus_ct_residual'}:
-            return shared_velocity
+        ct_emb = self.ct_embedding(ct)
+        z_adapted = self.input_adapter(torch.cat([z, ct_emb], dim=-1))
+        shared_velocity = self.base_flow_map.calc_phi(s, t, z_adapted)
         t_scalar = t if isinstance(t, torch.Tensor) else torch.tensor(t, device=z.device, dtype=z.dtype)
         return shared_velocity + self._compute_drift(z, t_scalar, ct)
 

@@ -1,4 +1,4 @@
-"""Reusable representation models extracted from scCodyFlow's research implementation."""
+"""Gaussian and Gaussian-mixture variational autoencoders."""
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -8,23 +8,6 @@ ACT_FUNC_MAP = {"relu": nn.ReLU(), "gelu": nn.GELU(), "softplus": nn.Softplus()}
 
 def sample_gaussian(mean, std):
     return mean + std.clamp_min(1e-8) * torch.randn_like(mean)
-
-def negative_binomial_loss(x, mu, theta, eps=1e-8, is_log_input=True):
-    """
-    Computes NB negative log-likelihood.
-    Robust to log-transformed inputs by inverting them to counts.
-    """
-    if is_log_input:
-        x = torch.expm1(x) # Invert log1p -> counts
-        x = F.relu(x)      # Safety
-
-    def log_gamma(v): return torch.lgamma(v)
-
-    t1 = log_gamma(x + theta + eps) - log_gamma(theta + eps) - log_gamma(x + 1.0)
-    t2 = theta * (torch.log(theta + eps) - torch.log(theta + mu + eps))
-    t3 = x * (torch.log(mu + eps) - torch.log(theta + mu + eps))
-
-    return -torch.mean(t1 + t2 + t3)
 
 class MLP(nn.Sequential):
     """
@@ -195,67 +178,5 @@ class GMVAE(VAE):
             "loss": total_loss.item(),
             "recon_loss": recon_loss.item(),
             "kl_loss": kl_loss.item()
-        }
-        return total_loss, logs, recon_loss, kl_loss
-
-class CountEncoderMixin:
-    """Encode raw counts through log1p while keeping NB reconstruction count-native."""
-
-    def encode(self, x):
-        x_enc = torch.log1p(torch.clamp(x, min=0.0))
-        return super().encode(x_enc)
-
-class VAE_NB(CountEncoderMixin, VAE):
-    """Count-native NB VAE with the same latent geometry as ``VAE``.
-
-    The decoder returns raw logits. ``loss`` applies exactly one softplus to get
-    the positive NB mean, avoiding the old double-softplus/SCVI tuple path.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.px_r = nn.Parameter(torch.zeros(self.input_dim))
-
-    def loss(self, x, recon, mu, logvar, beta_kl=1.0):
-        x_counts = torch.clamp(x, min=0.0)
-        mu_counts = F.softplus(recon)
-        theta = torch.exp(self.px_r) + 1e-4
-        recon_loss = negative_binomial_loss(x_counts, mu_counts, theta, is_log_input=False)
-        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-        total_loss = recon_loss + beta_kl * kl_loss
-        logs = {
-            "loss": total_loss.item(),
-            "recon_loss": recon_loss.item(),
-            "kl_loss": kl_loss.item(),
-        }
-        return total_loss, logs, recon_loss, kl_loss
-
-class GMVAE_NB(CountEncoderMixin, GMVAE):
-    """Count-native NB GMVAE with the same GMM prior as ``GMVAE``."""
-
-    def __init__(self, input_dim=None, *args, n_input=None, **kwargs):
-        n_input = input_dim if n_input is None else n_input
-        if n_input is None:
-            raise TypeError("GMVAE_NB requires input_dim or n_input")
-        super().__init__(n_input, *args, **kwargs)
-        self.px_r = nn.Parameter(torch.zeros(self.input_dim))
-
-    def loss(self, x, recon, mu, logvar, beta_kl=1.0):
-        x_counts = torch.clamp(x, min=0.0)
-        mu_counts = F.softplus(recon)
-        theta = torch.exp(self.px_r) + 1e-4
-        recon_loss = negative_binomial_loss(x_counts, mu_counts, theta, is_log_input=False)
-
-        z = self.reparameterize(mu, logvar)
-        q_dist = dist.Normal(mu, (logvar.exp() + 1e-4).sqrt())
-        log_q = q_dist.log_prob(z).sum(-1)
-        log_p = self.get_gmm_prior().log_prob(z)
-        kl_loss = (log_q - log_p).mean()
-
-        total_loss = recon_loss + beta_kl * kl_loss
-        logs = {
-            "loss": total_loss.item(),
-            "recon_loss": recon_loss.item(),
-            "kl_loss": kl_loss.item(),
         }
         return total_loss, logs, recon_loss, kl_loss

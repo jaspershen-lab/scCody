@@ -5,33 +5,31 @@ import pandas as pd
 from scipy import sparse
 
 
-def validate_data(adata, config, *, require_time=True, require_sample=True):
+def validate_data(adata, config, *, require_time=True, require_sample=True, require_strata=True,
+                  require_cell_type=True):
     config.validate()
     if adata.n_obs == 0 or adata.n_vars == 0:
         raise ValueError("Input must contain cells and genes")
     if not adata.var_names.is_unique or not adata.obs_names.is_unique:
         raise ValueError("Gene and cell IDs must be unique")
     d = config.data
-    keys = list(d.stratify_keys)
+    keys = list(d.stratify_keys) if require_strata else []
     if require_time:
         keys.append(d.time_key)
     if require_sample:
         keys.append(d.sample_key)
-    if config.model.scope == "cell_type":
+    if require_cell_type and config.model.scope == "cell_type":
         keys.append(d.cell_type_key)
     for key in set(keys):
-        if key not in adata.obs:
-            raise ValueError(f"Missing observation column {key!r}")
         if adata.obs[key].isna().any():
             raise ValueError(f"Observation column {key!r} contains missing values")
     if require_time:
         times = pd.to_numeric(adata.obs[d.time_key], errors="coerce").to_numpy(dtype=float)
         if not np.isfinite(times).all():
             raise ValueError("Time values must be finite numbers")
-    if require_sample:
-        for key in d.stratify_keys:
-            if (adata.obs.groupby(d.sample_key, observed=True)[key].nunique() > 1).any():
-                raise ValueError(f"Each sample must have one {key!r} value")
+    if require_sample and require_time:
+        if (adata.obs.groupby(d.sample_key, observed=True)[d.time_key].nunique() > 1).any():
+            raise ValueError(f"Each sample must have one {d.time_key!r} value")
     matrix = get_matrix(adata, d.layer)
     # Validate without densifying the matrix; all transforms operate on cell batches.
     values = matrix.data if sparse.issparse(matrix) else np.asarray(matrix)
@@ -44,14 +42,12 @@ def validate_data(adata, config, *, require_time=True, require_sample=True):
 def get_matrix(adata, layer):
     if layer is None:
         return adata.X
-    if layer not in adata.layers:
-        raise ValueError(f"Missing expression layer {layer!r}")
     return adata.layers[layer]
 
 
-def transform(matrix, data_config, representation):
+def transform(matrix, data_config):
     values = matrix.astype(np.float32)
-    if data_config.input_space == "counts" and not representation.endswith("_nb"):
+    if data_config.input_space == "counts":
         totals = np.asarray(values.sum(axis=1)).ravel()
         factors = data_config.normalize_total / np.maximum(totals, 1)
         if sparse.issparse(values):
@@ -67,7 +63,7 @@ def expression_rows(adata, config, indices, gene_indices, library_indices=None):
     values = get_matrix(adata, config.data.layer)[indices]
     if library_indices is not None:
         values = values[:, library_indices]
-    values = transform(values, config.data, config.model.representation)
+    values = transform(values, config.data)
     values = values[:, gene_indices]
     if sparse.issparse(values):
         values = values.toarray()
@@ -101,10 +97,6 @@ def prepare(adata, config):
     metadata = adata.obs.copy()
     metadata[d.sample_key] = metadata[d.sample_key].astype(str)
     metadata[d.time_key] = pd.to_numeric(metadata[d.time_key]).astype(float)
-    # A sample is one biological unit, with one time and stratum.
-    for key in [d.time_key, *d.stratify_keys]:
-        if (metadata.groupby(d.sample_key, observed=True)[key].nunique() > 1).any():
-            raise ValueError(f"Each sample must have one {key!r} value")
     samples = np.array(sorted(metadata[d.sample_key].unique()))
     rng = np.random.default_rng(t.seed)
     if s.validation_samples or s.test_samples:
@@ -126,6 +118,12 @@ def prepare(adata, config):
     table["split"] = table[d.sample_key].map(lambda x: "validation" if x in validation else "test" if x in test else "train")
     indices = {name: np.flatnonzero(metadata[d.sample_key].isin(ids).to_numpy())
                for name, ids in [("train", train), ("validation", validation), ("test", test)]}
+    if d.max_train_time is not None:
+        indices["train"] = indices["train"][metadata.iloc[indices["train"]][d.time_key].to_numpy() <= d.max_train_time]
+        outside = (table["split"] == "train") & (table[d.time_key] > d.max_train_time)
+        table.loc[outside, "split"] = "outside_fit_domain"
+    if not len(indices["train"]):
+        raise ValueError("No training cells remain in the configured fit domain")
     fitted_times = pd.to_numeric(metadata.iloc[indices["train"]][d.time_key]).to_numpy(dtype=float)
     if np.ptp(fitted_times) <= 0:
         raise ValueError("Training samples must cover at least two distinct times")
@@ -136,7 +134,7 @@ def prepare(adata, config):
         squares = np.zeros_like(total)
         for start in range(0, len(indices["train"]), t.representation_batch_size):
             block = get_matrix(adata, d.layer)[indices["train"][start:start + t.representation_batch_size]]
-            block = transform(block, d, m.representation).astype(np.float64)
+            block = transform(block, d).astype(np.float64)
             total += np.asarray(block.sum(axis=0)).ravel()
             squares += np.asarray(block.multiply(block).sum(axis=0) if sparse.issparse(block) else np.square(block).sum(axis=0)).ravel()
         variance = squares / len(indices["train"]) - np.square(total / len(indices["train"]))
@@ -145,16 +143,8 @@ def prepare(adata, config):
     gene_indices = align_genes(adata, genes)
     origin = float(fitted_times.min()) if m.time_origin is None else float(m.time_origin)
     scale = float(np.ptp(fitted_times)) if m.time_scale is None else float(m.time_scale)
-    cell_types = sorted(metadata.iloc[indices["train"]][d.cell_type_key].astype(str).unique()) if m.scope == "cell_type" else []
-    family_keys = [*d.stratify_keys, *([d.cell_type_key] if m.scope == "cell_type" else [])]
-    fitted_metadata = metadata.iloc[indices["train"]]
-    if family_keys:
-        supported = fitted_metadata.groupby(family_keys, observed=True)[d.time_key].nunique()
-        if (supported < 2).any():
-            raise ValueError("Each training stratum/cell type needs at least two times; adjust sample splits")
-        if t.selection == "validation_gene_ot":
-            train_families = {tuple(map(str, row)) for row in fitted_metadata[family_keys].drop_duplicates().itertuples(index=False, name=None)}
-            validation_families = {tuple(map(str, row)) for row in metadata.iloc[indices["validation"]][family_keys].drop_duplicates().itertuples(index=False, name=None)}
-            if not validation_families <= train_families:
-                raise ValueError("Validation includes a stratum/cell type absent from training; adjust sample splits")
+    observed_types = sorted(metadata.iloc[indices["train"]][d.cell_type_key].astype(str).unique()) if m.scope == "cell_type" else []
+    cell_types = list(m.cell_types) if m.scope == "cell_type" and m.cell_types else observed_types
+    if not set(observed_types) <= set(cell_types):
+        raise ValueError("Configured cell_types omit types present in training")
     return PreparedData(genes, gene_indices, table, indices["train"], indices["validation"], indices["test"], origin, scale, cell_types)

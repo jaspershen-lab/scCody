@@ -6,9 +6,10 @@ import logging
 import numpy as np
 import pandas as pd
 import torch
-from geomloss import SamplesLoss
 from torch.nn import functional as F
 from .data import expression_rows
+from .losses import sinkhorn_divergence
+from .trajectories import training_pairs, endpoint_triples
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,7 @@ class Population:
     rows: np.ndarray
     latent: torch.Tensor
     codes: torch.Tensor
+    sample_id: str
 
     @property
     def family(self):
@@ -32,13 +34,14 @@ def tensor_rows(adata, pipeline, rows):
 
 
 def decode(pipeline, latent):
-    return F.softplus(pipeline.representation.decode(latent))
+    raw = pipeline.representation.decode(latent)
+    return raw if pipeline.config.model.no_softplus_decode else F.softplus(raw)
 
 
 def distance(pipeline):
     t = pipeline.config.training
-    # Tensorized backend bounds memory to configured cell batches on CPU and GPU.
-    return SamplesLoss("sinkhorn", p=2, blur=t.sinkhorn_blur, scaling=t.sinkhorn_scaling, backend="tensorized")
+    return lambda source, target: sinkhorn_divergence(
+        source, target, blur=t.sinkhorn_blur, scaling=t.sinkhorn_scaling)
 
 
 def flow(pipeline, source_time, target_time, latent, codes):
@@ -70,20 +73,18 @@ def populations(adata, pipeline, rows, *, unit=None):
                 values = tensor_rows(adata, pipeline, group_rows[start:start + t.representation_batch_size])
                 chunks.append(pipeline.representation.encode(values)[0].cpu())
             ct = str(group[d.cell_type_key].iloc[0]) if pipeline.config.model.scope == "cell_type" else None
-            if ct is not None and ct not in pipeline.cell_types:
-                raise ValueError(f"Cell type {ct!r} was not present in training")
             code = pipeline.cell_types.index(ct) if ct is not None else 0
             nodes.append(Population(float(group["_time"].iloc[0]),
                                     tuple(str(group[k].iloc[0]) for k in d.stratify_keys), ct,
-                                    group_rows, torch.cat(chunks), torch.full((len(group_rows),), code, dtype=torch.long)))
+                                    group_rows, torch.cat(chunks), torch.full((len(group_rows),), code, dtype=torch.long),
+                                    str(group["_sample"].iloc[0])))
     return nodes
 
 
-def train_representation(adata, pipeline, rows, outdir):
+def train_representation(adata, pipeline, rows):
     t = pipeline.config.training
     rng = np.random.default_rng(t.seed)
     optimizer = torch.optim.AdamW(pipeline.representation.parameters(), lr=t.representation_lr, weight_decay=1e-4, betas=(0.9, 0.99))
-    history = []
     for epoch in range(1, t.representation_epochs + 1):
         pipeline.representation.train()
         shuffled = rng.permutation(rows)
@@ -93,18 +94,14 @@ def train_representation(adata, pipeline, rows, outdir):
             optimizer.zero_grad(set_to_none=True)
             mean, logvar = pipeline.representation.encode(values)
             latent = pipeline.representation.reparameterize(mean, logvar)
-            raw = pipeline.representation.decode(latent)
-            recon = raw if pipeline.config.model.representation.endswith("_nb") else F.softplus(raw)
+            recon = decode(pipeline, latent)
             loss = pipeline.representation.loss(values, recon, mean, logvar, beta_kl=t.beta)[0]
             if not torch.isfinite(loss):
                 raise RuntimeError("Representation loss became nonfinite")
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(pipeline.representation.parameters(), 5.0)
             optimizer.step()
             total += float(loss.detach()) * len(values)
-        history.append({"epoch": epoch, "loss": total / len(rows)})
-        logger.info("Representation epoch %d/%d: %.6g", epoch, t.representation_epochs, history[-1]["loss"])
-        pd.DataFrame(history).to_csv(outdir / "representation_history.csv", index=False)
+        logger.info("Representation epoch %d/%d: %.6g", epoch, t.representation_epochs, total / len(rows))
     pipeline.representation.eval()
     pipeline.representation.requires_grad_(False)
 
@@ -114,90 +111,118 @@ def sample_node(node, size, rng, device):
     return node.latent[indices].to(device), node.codes[indices].to(device), node.rows[indices]
 
 
+def trajectory_step(adata, pipeline, members, rng, optimizer, sinkhorn):
+    """Average population-pair losses while releasing each graph after backward."""
+    t = pipeline.config.training
+    members = sorted(members, key=lambda n: (n.time, n.sample_id))
+    if len(members) > t.trajectory_nodes:
+        positions = rng.choice(len(members), size=t.trajectory_nodes, replace=False)
+        members = sorted([members[int(i)] for i in positions], key=lambda n: (n.time, n.sample_id))
+    times = [n.time for n in members]
+    batches = []
+    for node in members:
+        positions = rng.choice(len(node.rows), size=t.cell_batch_size, replace=len(node.rows) < t.cell_batch_size)
+        batches.append((node.latent[positions].to(pipeline.device), node.codes[positions].to(pipeline.device), node.rows[positions]))
+    pairs = training_pairs(times, t.sources_per_target, rng)
+    if not pairs:
+        return None
+    triples = endpoint_triples(times, t.endpoint_pairs, rng) if t.endpoint_weight else []
+    # A bounded trajectory cache avoids one sparse slice per supervised pair.
+    expressions = tensor_rows(adata, pipeline, np.concatenate([b[2] for b in batches]))
+    expressions = expressions.split(t.cell_batch_size)
+    optimizer.zero_grad(set_to_none=True)
+    total = 0.0
+    for source, target in pairs:
+        z, codes, _ = batches[source]
+        predicted = flow(pipeline, times[source], times[target], z, codes)
+        loss = predicted.sum() * 0.0
+        if t.latent_ot_weight:
+            loss = loss + t.latent_ot_weight * sinkhorn(predicted, batches[target][0])
+        if t.gene_ot_weight:
+            loss = loss + t.gene_ot_weight * sinkhorn(expressions[target], decode(pipeline, predicted))
+        loss = loss / len(pairs)
+        if not torch.isfinite(loss):
+            raise RuntimeError("Transport pair loss became nonfinite")
+        total += float(loss.detach())
+        loss.backward()
+    for a, b, target in triples:
+        za, ca, _ = batches[a]
+        zb, cb, _ = batches[b]
+        first = flow(pipeline, times[a], times[target], za, ca)
+        second = flow(pipeline, times[b], times[target], zb, cb)
+        loss = t.endpoint_weight * sinkhorn(first, second) / len(triples)
+        if not torch.isfinite(loss):
+            raise RuntimeError("Endpoint consistency became nonfinite")
+        total += float(loss.detach())
+        loss.backward()
+    torch.nn.utils.clip_grad_norm_(pipeline.transport.parameters(), 5.0)
+    optimizer.step()
+    return total
+
+
 def validation_score(adata, pipeline, training_nodes, validation_nodes):
-    """Known-time expression score on sample-disjoint validation populations."""
-    rng = np.random.default_rng(pipeline.config.training.seed + 1)
-    sinkhorn = distance(pipeline)
-    scores = []
-    with torch.no_grad():
-        for target in validation_nodes:
-            sources = [n for n in training_nodes if n.family == target.family and n.time != target.time]
-            if not sources:
-                raise ValueError(f"Validation population needs a matching training source at a different time: {target.family}")
-            source = min(sources, key=lambda n: (abs(n.time - target.time), n.time))
-            z, codes, _ = sample_node(source, pipeline.config.training.cell_batch_size, rng, pipeline.device)
-            _, _, target_rows = sample_node(target, pipeline.config.training.cell_batch_size, rng, pipeline.device)
-            predicted = decode(pipeline, flow(pipeline, source.time, target.time, z, codes))
-            scores.append(float(sinkhorn(predicted, tensor_rows(adata, pipeline, target_rows)).detach()))
-    if not scores or not np.isfinite(scores).all():
-        raise ValueError("Validation selection requires finite supported validation populations")
-    # One population per sample (or sample/cell-type), so large cell counts do not set weights.
-    return float(np.mean(scores))
+    """Score complete held-out donors from pooled youngest-age training cells."""
+    from .selection import evaluate_holdout_l_gene, pooled_youngest_forward
+    source_age = min(node.time for node in training_nodes)
+    pool = [node for node in training_nodes if node.time == source_age]
+    latent = torch.cat([node.latent for node in pool])
+    codes = torch.cat([node.codes for node in pool])
+    entries = {source_age: np.arange(len(latent))}
+    donors = defaultdict(list)
+    for node in validation_nodes:
+        donors[node.sample_id].append(node)
+    groups = [(donor, nodes[0].time, np.sort(np.concatenate([n.rows for n in nodes])))
+              for donor, nodes in sorted(donors.items())]
+
+    def rollout(age, rows, count, target_age):
+        moved = flow(pipeline, age, target_age, latent[rows].to(pipeline.device), codes[rows].to(pipeline.device))
+        return decode(pipeline, moved)
+
+    d, t = pipeline.config.data, pipeline.config.training
+    result = evaluate_holdout_l_gene(adata, age_key=d.time_key, donor_key=d.sample_key,
+        seed=t.seed, device=pipeline.device, groups=groups,
+        get_expression=lambda data, rows: tensor_rows(data, pipeline, rows),
+        predict_group=lambda age, rows, rng: pooled_youngest_forward(entries, age, len(rows), rng, rollout),
+        blur=t.sinkhorn_blur, scaling=t.sinkhorn_scaling)
+    return result["selection_score"]
 
 
-def train_transport(adata, pipeline, nodes, validation_nodes, outdir):
+def train_transport(adata, pipeline, nodes, validation_nodes):
     t = pipeline.config.training
     rng = np.random.default_rng(t.seed)
     families = defaultdict(list)
     for node in nodes:
-        families[node.family].append(node)
-    for family, members in families.items():
-        if len({n.time for n in members}) < 2:
-            raise ValueError(f"Training stratum/cell type {family} needs at least two times")
+        if len(node.rows) >= t.min_population_cells:
+            families[node.family].append(node)
+    families = {key: members for key, members in families.items()
+                if len(members) >= t.min_population_nodes and len({n.time for n in members}) >= 2}
+    if not families:
+        raise ValueError("No training stratum/cell type has sufficient population support")
+    pipeline.trained_families = set(families)
     groups = list(families.values())
-    optimizer = torch.optim.Adam(pipeline.transport.parameters(), lr=t.flow_lr)
+    optimizer = torch.optim.Adam(pipeline.transport.parameters(), lr=t.flow_lr, betas=tuple(t.adam_betas))
     sinkhorn = distance(pipeline)
     best_score, best_state, best_epoch = float("inf"), None, None
-    history = []
-    # Validate support before starting the production training budget.
-    if t.selection == "validation_gene_ot":
-        validation_score(adata, pipeline, nodes, validation_nodes)
     for epoch in range(1, t.flow_epochs + 1):
         pipeline.transport.train()
         totals = []
         for _ in range(t.steps_per_epoch):
             members = groups[int(rng.integers(len(groups)))]
-            # Choose two distinct times, then a sample at each time; support reverse transport.
-            times = sorted({n.time for n in members})
-            chosen = rng.choice(times, 2, replace=False)
-            s, target_time = chosen if t.bidirectional else sorted(chosen)
-            sources = [n for n in members if n.time == s]
-            targets = [n for n in members if n.time == target_time]
-            source = sources[int(rng.integers(len(sources)))]
-            target = targets[int(rng.integers(len(targets)))]
-            z, codes, _ = sample_node(source, t.cell_batch_size, rng, pipeline.device)
-            z_target, _, rows_target = sample_node(target, t.cell_batch_size, rng, pipeline.device)
-            optimizer.zero_grad(set_to_none=True)
-            predicted = flow(pipeline, s, target_time, z, codes)
-            loss = t.latent_ot_weight * sinkhorn(predicted, z_target)
-            if t.gene_ot_weight:
-                loss = loss + t.gene_ot_weight * sinkhorn(decode(pipeline, predicted), tensor_rows(adata, pipeline, rows_target))
-            # Endpoint consistency compares independent source populations at a common target.
-            if t.endpoint_weight:
-                other = [n for n in members if n is not source and n is not target and n.time != target_time]
-                if other:
-                    second = other[int(rng.integers(len(other)))]
-                    z2, c2, _ = sample_node(second, t.cell_batch_size, rng, pipeline.device)
-                    endpoint = flow(pipeline, second.time, target_time, z2, c2)
-                    loss = loss + t.endpoint_weight * sinkhorn(predicted, endpoint)
-            if not torch.isfinite(loss):
-                raise RuntimeError("Transport loss became nonfinite")
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(pipeline.transport.parameters(), 5.0)
-            optimizer.step()
-            totals.append(float(loss.detach()))
+            total = trajectory_step(adata, pipeline, members, rng, optimizer, sinkhorn)
+            if total is not None:
+                totals.append(total)
         pipeline.transport.eval()
+        if not totals:
+            raise RuntimeError("No supported temporal pairs were sampled this epoch")
         score = validation_score(adata, pipeline, nodes, validation_nodes) if t.selection == "validation_gene_ot" else None
         if t.selection == "last" or score < best_score:
             best_score = score if score is not None else float("inf")
             best_state = deepcopy(pipeline.transport.state_dict())
             best_epoch = epoch
-        history.append({"epoch": epoch, "train_loss": float(np.mean(totals)), "validation_gene_ot": score})
-        pd.DataFrame(history).to_csv(outdir / "flow_history.csv", index=False)
-        logger.info("Transport epoch %d/%d: loss=%.6g validation=%s", epoch, t.flow_epochs, history[-1]["train_loss"], score)
+        logger.info("Transport epoch %d/%d: loss=%.6g validation=%s", epoch, t.flow_epochs, float(np.mean(totals)), score)
     pipeline.transport.load_state_dict(best_state)
     pipeline.transport.eval()
     pipeline.selection = {"criterion": t.selection, "epoch": best_epoch,
                           "validation_score": None if t.selection == "last" else best_score,
-                          "test_samples_used": False}
-    return history
+                          "source_policy": "pooled_youngest_forward"}
+    return pipeline.selection
